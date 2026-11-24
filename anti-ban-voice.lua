@@ -267,7 +267,7 @@ local function installMuteHook()
 		pcall(function()
 			origMute = hookFunc(VoiceChatSvc.SetMuted,
 				function(self, muted, ...)
-					if muted == true and (State.VoiceFilter or State.MicSpoof) then
+					if muted == true and (State.VoiceFilter or State.MicSpoof or State.GhostMic) then
 						return
 					end
 					return origMute(self, muted, ...)
@@ -290,6 +290,11 @@ local jitterInterval = 0.3
 local function startMainLoop()
 	if Conns.main then return end
 	Conns.main = RunService.Heartbeat:Connect(function(dt)
+		-- Ghost Mic ON: voice chat resmi harus stay muted, jangan di-force unmute
+		if State.GhostMic then
+			pcall(function() VoiceChatSvc:SetMuted(true) end)
+			return
+		end
 		if State.VoiceFilter or State.MicSpoof then
 			jitterAcc = jitterAcc + dt
 			if jitterAcc >= jitterInterval then
@@ -308,7 +313,8 @@ local function stopMainLoop()
 end
 
 local function refreshMainLoop()
-	if State.VoiceFilter or State.MicSpoof then
+	-- Ghost Mic butuh loop juga untuk keep voice chat stay muted
+	if State.VoiceFilter or State.MicSpoof or State.GhostMic then
 		installMuteHook()
 		startMainLoop()
 	else
@@ -400,6 +406,8 @@ local function enableGM()
 	if not root then return end
 
 	-- mute Roblox voice chat resmi — AI nggak denger
+	-- install hook dulu biar Roblox internal nggak bisa unmute balik
+	installMuteHook()
 	pcall(function() VoiceChatSvc:SetMuted(true) end)
 
 	-- bersihkan kalau udah ada
@@ -641,6 +649,146 @@ UIS.InputBegan:Connect(function(inp)
 	end
 	State.PanelOpen = false
 	Panel.Visible   = false
+end)
+
+------------------------------------------------------------------------
+-- GHOST MIC DEBUG PANEL
+-- Tampil di bawah panel utama, hanya kalau GhostMic ON
+-- Baris: [👻 Ghost Mic] [🔇 Roblox Mic] [🎤 AudioInput] [📡 Emitter]
+------------------------------------------------------------------------
+local DBG_W, DBG_H = CFG.PANEL_W, 92
+local DebugPanel = Instance.new("Frame")
+DebugPanel.Name        = "GhostDebug"
+DebugPanel.Size        = UDim2.new(0, DBG_W, 0, DBG_H)
+DebugPanel.BackgroundColor3 = Color3.fromRGB(10, 7, 22)
+DebugPanel.BorderSizePixel  = 0
+DebugPanel.Visible     = false
+DebugPanel.ZIndex      = 15
+DebugPanel.Parent      = SG
+Instance.new("UICorner", DebugPanel).CornerRadius = UDim.new(0, 10)
+local dbs = Instance.new("UIStroke")
+dbs.Color = Color3.fromRGB(80, 50, 160); dbs.Thickness = 1.2; dbs.Parent = DebugPanel
+
+local DBG_HEADER = Instance.new("TextLabel")
+DBG_HEADER.Size = UDim2.new(1, -12, 0, 20)
+DBG_HEADER.Position = UDim2.new(0, 10, 0, 6)
+DBG_HEADER.BackgroundTransparency = 1
+DBG_HEADER.Text = "👻 Ghost Mic Debug"
+DBG_HEADER.TextColor3 = Color3.fromRGB(160, 130, 230)
+DBG_HEADER.TextSize = 10; DBG_HEADER.Font = Enum.Font.GothamBold
+DBG_HEADER.TextXAlignment = Enum.TextXAlignment.Left
+DBG_HEADER.ZIndex = 16; DBG_HEADER.Parent = DebugPanel
+
+-- 4 baris status
+local dbgRows = {}
+local DBG_LABELS = {
+	"Roblox Mic",
+	"AudioDeviceInput",
+	"AudioEmitter",
+	"Hook aktif",
+}
+for i, labelTxt in ipairs(DBG_LABELS) do
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, -12, 0, 14)
+	row.Position = UDim2.new(0, 10, 0, 22 + (i-1)*16)
+	row.BackgroundTransparency = 1; row.ZIndex = 16; row.Parent = DebugPanel
+
+	local dot = Instance.new("Frame")
+	dot.Size = UDim2.new(0, 8, 0, 8); dot.Position = UDim2.new(0, 0, 0.5, -4)
+	dot.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+	dot.BorderSizePixel = 0; dot.ZIndex = 17; dot.Parent = row
+	Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+
+	local lbl = Instance.new("TextLabel")
+	lbl.Size = UDim2.new(0.55, -12, 1, 0); lbl.Position = UDim2.new(0, 14, 0, 0)
+	lbl.BackgroundTransparency = 1
+	lbl.Text = labelTxt
+	lbl.TextColor3 = Color3.fromRGB(140, 130, 165); lbl.TextSize = 10
+	lbl.Font = Enum.Font.Gotham
+	lbl.TextXAlignment = Enum.TextXAlignment.Left
+	lbl.ZIndex = 17; lbl.Parent = row
+
+	local val = Instance.new("TextLabel")
+	val.Size = UDim2.new(0.45, 0, 1, 0); val.Position = UDim2.new(0.55, 0, 0, 0)
+	val.BackgroundTransparency = 1
+	val.Text = "—"
+	val.TextColor3 = Color3.fromRGB(180, 170, 210); val.TextSize = 10
+	val.Font = Enum.Font.GothamBold
+	val.TextXAlignment = Enum.TextXAlignment.Right
+	val.ZIndex = 17; val.Parent = row
+
+	dbgRows[i] = { dot = dot, val = val }
+end
+
+local function setDbgRow(i, ok, text)
+	dbgRows[i].dot.BackgroundColor3 = ok
+		and Color3.fromRGB(60, 210, 100)
+		or  Color3.fromRGB(210, 70, 70)
+	dbgRows[i].val.Text = text
+end
+
+local function positionDebugPanel()
+	local pp = DebugPanel
+	if not Panel.Visible then
+		-- kalau panel utama tutup, letakkan langsung di bawah logo
+		local lf = LogoFrame.Position
+		pp.Position = UDim2.new(
+			lf.X.Scale, lf.X.Offset + CFG.LOGO_SIZE + 10,
+			lf.Y.Scale, lf.Y.Offset
+		)
+	else
+		-- di bawah panel utama, +6px gap
+		pp.Position = UDim2.new(
+			Panel.Position.X.Scale, Panel.Position.X.Offset,
+			Panel.Position.Y.Scale, Panel.Position.Y.Offset + CFG.PANEL_H + 6
+		)
+	end
+end
+
+local dbgAcc = 0
+Conns.dbg = RunService.Heartbeat:Connect(function(dt)
+	if not State.GhostMic then
+		if DebugPanel.Visible then DebugPanel.Visible = false end
+		return
+	end
+	if not DebugPanel.Visible then
+		DebugPanel.Visible = true
+	end
+	positionDebugPanel()
+
+	dbgAcc = dbgAcc + dt
+	if dbgAcc < 0.4 then return end
+	dbgAcc = 0
+
+	-- Row 1: Roblox Mic muted?
+	local robloxMuted = false
+	pcall(function() robloxMuted = VoiceChatSvc:IsLocalMuted() end)
+	-- IsLocalMuted belum ada di semua executor — fallback: cek property
+	if not robloxMuted then
+		pcall(function()
+			local lpm = VoiceChatSvc:GetMuteState(Players.LocalPlayer)
+			robloxMuted = (lpm == Enum.VoiceChatState.Muted
+				or lpm == Enum.VoiceChatState.Hidden)
+		end)
+	end
+	setDbgRow(1, robloxMuted, robloxMuted and "MUTED ✓" or "AKTIF ⚠")
+
+	-- Row 2: AudioDeviceInput ada + not muted
+	local inputOk = false
+	local inputTxt = "nggak ada"
+	if gmInput and gmInput.Parent then
+		inputOk = not gmInput.Muted
+		inputTxt = inputOk and "capturing ✓" or "Muted ✗"
+	end
+	setDbgRow(2, inputOk, inputTxt)
+
+	-- Row 3: AudioEmitter ada
+	local emitterOk = gmEmitter ~= nil and gmEmitter.Parent ~= nil
+	setDbgRow(3, emitterOk, emitterOk and "ada ✓" or "nggak ada ✗")
+
+	-- Row 4: hook SetMuted terpasang
+	local hookOk = origMute ~= nil
+	setDbgRow(4, hookOk, hookOk and "terpasang ✓" or "nggak ada ✗")
 end)
 
 ------------------------------------------------------------------------
