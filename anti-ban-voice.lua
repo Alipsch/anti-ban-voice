@@ -16,10 +16,10 @@
 -- CONFIG
 ------------------------------------------------------------------------
 local CFG = {
-	LOGO_IMAGE     = "",   -- FILL: "rbxassetid://ID_KAMU"
+	LOGO_IMAGE     = "",
 	LOGO_SIZE      = 48,
 	PANEL_W        = 215,
-	PANEL_H        = 225,
+	PANEL_H        = 272,  -- tambah 47px untuk row ke-4
 	DRAG_THRESHOLD = 14,
 }
 
@@ -42,6 +42,7 @@ local State = {
 	VoiceFilter = false,
 	MicSpoof    = false,
 	AntiKick    = false,
+	GhostMic    = false,  -- mic keliatan off, player lain denger via AudioEmitter
 }
 local Conns    = {}
 local hooked   = {}
@@ -365,8 +366,82 @@ local function disableAK()
 end
 
 ------------------------------------------------------------------------
--- BUILD TOGGLES
+-- GHOST MIC
+-- Cara kerja:
+--   1. Roblox voice chat di-mute (SetMuted true) — AI detection nggak proses
+--   2. AudioDeviceInput → AudioEmitter di karakter lo
+--   3. Tiap player lain punya AudioListener di karakter mereka (via server script)
+--   4. Roblox 3D audio system forward suara lo ke player sekitar secara natural
+-- Roblox voice moderation nggak menyentuh AudioEmitter/AudioListener pipeline.
 ------------------------------------------------------------------------
+local gmInput    = nil  -- AudioDeviceInput
+local gmEmitter  = nil  -- AudioEmitter di karakter lo
+local gmAnalyser = nil  -- AudioAnalyser untuk cek mic aktif (opsional)
+local SoundSvc   = game:GetService("SoundService")
+local RS         = game:GetService("ReplicatedStorage")
+
+-- RemoteEvent untuk minta server setup AudioListener di tiap player
+local gmRemote
+local function getOrCreateRemote()
+	if gmRemote then return gmRemote end
+	local existing = RS:FindFirstChild("GhostMicSetup")
+	if existing then gmRemote = existing; return gmRemote end
+	-- executor bisa create di ReplicatedStorage dari client
+	local re = Instance.new("RemoteEvent")
+	re.Name = "GhostMicSetup"
+	re.Parent = RS
+	gmRemote = re
+	return gmRemote
+end
+
+local function enableGM()
+	local char = lp.Character or lp.CharacterAdded:Wait()
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+
+	-- mute Roblox voice chat resmi — AI nggak denger
+	pcall(function() VoiceChatSvc:SetMuted(true) end)
+
+	-- bersihkan kalau udah ada
+	if gmInput then pcall(function() gmInput:Destroy() end); gmInput = nil end
+	if gmEmitter then pcall(function() gmEmitter:Destroy() end); gmEmitter = nil end
+
+	-- AudioDeviceInput: tangkap mic hardware lo
+	gmInput = Instance.new("AudioDeviceInput")
+	gmInput.Player = lp
+	gmInput.Muted  = false
+	gmInput.Parent = root
+
+	-- AudioEmitter: broadcast ke dunia 3D Roblox
+	gmEmitter = Instance.new("AudioEmitter")
+	gmEmitter.Parent = root
+
+	-- Wire: AudioDeviceInput → AudioEmitter
+	local wire = Instance.new("Wire")
+	wire.SourceInstance = gmInput
+	wire.TargetInstance = gmEmitter
+	wire.Parent         = root
+
+	-- Minta server pasang AudioListener di semua player
+	pcall(function() getOrCreateRemote():FireServer("setup") end)
+
+	-- Reconnect kalau karakter respawn
+	if Conns.gmRespawn then Conns.gmRespawn:Disconnect() end
+	Conns.gmRespawn = lp.CharacterAdded:Connect(function(newChar)
+		if State.GhostMic then
+			task.wait(0.5)
+			enableGM()
+		end
+	end)
+end
+
+local function disableGM()
+	if gmInput   then pcall(function() gmInput:Destroy()   end); gmInput   = nil end
+	if gmEmitter then pcall(function() gmEmitter:Destroy() end); gmEmitter = nil end
+	if Conns.gmRespawn then Conns.gmRespawn:Disconnect(); Conns.gmRespawn = nil end
+	-- unmute Roblox voice chat balik
+	pcall(function() VoiceChatSvc:SetMuted(false) end)
+end
 buildToggle("🔇", "Voice Filter\nBlok auto-mute", "VoiceFilter", function(on)
 	if on then enableVF() else disableVF() end
 end)
@@ -376,6 +451,9 @@ end)
 buildToggle("🛡️", "Anti-Kick Voice\nFilter kick remote", "AntiKick", function(on)
 	if on then enableAK() else disableAK() end
 end)
+buildToggle("👻", "Ghost Mic\nMic off, player denger", "GhostMic", function(on)
+	if on then enableGM() else disableGM() end
+end)
 
 ------------------------------------------------------------------------
 -- WARNING UI SUPPRESSOR
@@ -383,71 +461,86 @@ end)
 -- PlayerGui dengan nama/text yang mengandung kata warning/violation/moderation.
 -- Kita scan tiap 2s dan hide semua yang match.
 ------------------------------------------------------------------------
-local StarterGui = game:GetService("StarterGui")
-local WARNING_KEYWORDS = {
-	"warn", "violation", "moderat", "inappropriate",
-	"voice", "suspend", "restrict", "guideline", "policy"
+------------------------------------------------------------------------
+-- WARNING / MODAL SUPPRESSOR v2
+-- Target: popup modal CoreGui Roblox voice warning
+-- "Kamu dapat kehilangan akses ke suara" dst.
+-- Strategy: scan TEKS KONTEN di semua TextLabel/TextButton,
+-- bukan nama instance — karena Roblox pakai nama internal kayak
+-- "VoiceChatPrompt", "SafetyBubble", bukan nama yang ngandung "warn".
+------------------------------------------------------------------------
+local MODAL_TEXT_PATTERNS = {
+	-- Bahasa Indonesia (Roblox lokalisasi)
+	"kehilangan akses", "ditangguhkan", "melanggar", "peraturan komunitas",
+	"fitur suara", "suara",
+	-- English fallback
+	"voice access", "suspended", "community guidelines", "voice feature",
+	"you may lose", "violation", "inappropriate", "safety",
 }
 
-local function containsWarningText(s)
-	if type(s) ~= "string" then return false end
+local function isModalText(s)
+	if type(s) ~= "string" or #s < 5 then return false end
 	local low = s:lower()
-	for _, kw in ipairs(WARNING_KEYWORDS) do
-		if low:find(kw) then return true end
+	for _, pat in ipairs(MODAL_TEXT_PATTERNS) do
+		if low:find(pat, 1, true) then return true end
 	end
 	return false
 end
 
-local function suppressWarningUIs(root)
+-- Sembunyikan seluruh ScreenGui/Frame ancestor kalau ada descendant yang match
+local function hideAncestorGui(obj)
+	local cur = obj
+	while cur and cur ~= game:GetService("CoreGui") do
+		if cur:IsA("ScreenGui") or (cur:IsA("Frame") and cur.Parent == game:GetService("CoreGui")) then
+			cur.Enabled = false
+			pcall(function() cur.Visible = false end)
+			return
+		end
+		cur = cur.Parent
+	end
+	-- fallback: hide obj sendiri
+	pcall(function() obj.Visible = false end)
+end
+
+local function scanAndSuppress(root)
 	for _, obj in ipairs(root:GetDescendants()) do
-		-- hide frame/label yang namanya atau textnya ngandung warning keyword
 		if obj:IsA("TextLabel") or obj:IsA("TextButton") then
-			if containsWarningText(obj.Text) or containsWarningText(obj.Name) then
-				local p = obj.Parent
-				-- hide parent frame biar nggak ada ghost space
-				if p and p:IsA("Frame") and containsWarningText(p.Name) then
-					p.Visible = false
-				else
-					obj.Visible = false
-				end
-			end
-		elseif obj:IsA("Frame") or obj:IsA("ScreenGui") then
-			if containsWarningText(obj.Name) then
-				obj.Visible = false
+			if isModalText(obj.Text) then
+				hideAncestorGui(obj)
 			end
 		end
 	end
 end
 
--- scan CoreGui (warning Roblox native) + PlayerGui (warning dari game server)
+-- Hook DescendantAdded di CoreGui — intercept modal saat muncul
+pcall(function()
+	local CoreGui = game:GetService("CoreGui")
+	CoreGui.DescendantAdded:Connect(function(obj)
+		if obj:IsA("TextLabel") or obj:IsA("TextButton") then
+			-- cek langsung
+			if isModalText(obj.Text) then
+				hideAncestorGui(obj)
+				return
+			end
+			-- teks bisa belum di-set saat DescendantAdded, tunggu sebentar
+			task.delay(0.05, function()
+				if obj and obj.Parent and isModalText(obj.Text) then
+					hideAncestorGui(obj)
+				end
+			end)
+		end
+	end)
+end)
+
+-- Scan berkala tiap 0.5s sebagai safety net
 local warnScanAcc = 0
-local WARN_SCAN_INTERVAL = 1.5
+local WARN_SCAN_INTERVAL = 0.5
 Conns.warnScan = RunService.Heartbeat:Connect(function(dt)
 	warnScanAcc = warnScanAcc + dt
 	if warnScanAcc < WARN_SCAN_INTERVAL then return end
 	warnScanAcc = 0
-	pcall(function() suppressWarningUIs(game:GetService("CoreGui")) end)
-	pcall(function() suppressWarningUIs(PlayerGui) end)
-end)
-
--- ChildAdded hook di CoreGui supaya warning baru langsung kehide
-pcall(function()
-	game:GetService("CoreGui").DescendantAdded:Connect(function(obj)
-		task.defer(function() -- defer biar obj sempat fully init
-			if not obj or not obj.Parent then return end
-			if obj:IsA("TextLabel") or obj:IsA("TextButton") then
-				if containsWarningText(obj.Text) or containsWarningText(obj.Name) then
-					obj.Visible = false
-					local p = obj.Parent
-					if p and p:IsA("Frame") then p.Visible = false end
-				end
-			elseif obj:IsA("Frame") or obj:IsA("ScreenGui") then
-				if containsWarningText(obj.Name) then
-					obj.Visible = false
-				end
-			end
-		end)
-	end)
+	pcall(function() scanAndSuppress(game:GetService("CoreGui")) end)
+	pcall(function() scanAndSuppress(PlayerGui) end)
 end)
 
 ------------------------------------------------------------------------
