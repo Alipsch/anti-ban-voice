@@ -16,7 +16,7 @@
 -- CONFIG
 ------------------------------------------------------------------------
 local CFG = {
-	LOGO_IMAGE     = "rbxassetid://71119773742781",   -- FILL: "rbxassetid://ID_KAMU"
+	LOGO_IMAGE     = "",   -- FILL: "rbxassetid://ID_KAMU"
 	LOGO_SIZE      = 48,
 	PANEL_W        = 215,
 	PANEL_H        = 225,
@@ -260,51 +260,78 @@ end
 ------------------------------------------------------------------------
 -- FEATURES
 ------------------------------------------------------------------------
-local function enableVF()
+-- Hook SetMuted sekali aja — shared antara VF dan MS
+local function installMuteHook()
 	if hookFunc and not origMute then
 		pcall(function()
 			origMute = hookFunc(VoiceChatSvc.SetMuted,
 				function(self, muted, ...)
-					if muted == true then return end
+					if muted == true and (State.VoiceFilter or State.MicSpoof) then
+						return
+					end
 					return origMute(self, muted, ...)
 				end)
 		end)
 	end
-	if not Conns.vf then
-		Conns.vf = RunService.Heartbeat:Connect(function()
-			if State.VoiceFilter then
-				pcall(function() VoiceChatSvc:SetMuted(false) end)
-			end
-		end)
-	end
 end
-local function disableVF()
-	if Conns.vf then Conns.vf:Disconnect(); Conns.vf = nil end
+
+local function removeMuteHook()
 	if origMute and hookFunc then
 		pcall(function() hookFunc(VoiceChatSvc.SetMuted, origMute) end)
 		origMute = nil
 	end
 end
 
-local function enableMS()
-	if not Conns.ms then
-		Conns.ms = RunService.Heartbeat:Connect(function()
-			if State.MicSpoof then
-				pcall(function()
-					if VoiceChatSvc.IsEnabled then VoiceChatSvc:SetMuted(false) end
-				end)
+-- Single heartbeat — gabungan VF + MS, jitter evasion biar pola aktivasi nggak detectable
+local jitterAcc = 0
+local jitterInterval = 0.3
+
+local function startMainLoop()
+	if Conns.main then return end
+	Conns.main = RunService.Heartbeat:Connect(function(dt)
+		if State.VoiceFilter or State.MicSpoof then
+			jitterAcc = jitterAcc + dt
+			if jitterAcc >= jitterInterval then
+				jitterAcc = 0
+				jitterInterval = 0.3 + math.random() * 0.6
+				pcall(function() VoiceChatSvc:SetMuted(false) end)
 			end
-		end)
+		else
+			jitterAcc = 0
+		end
+	end)
+end
+
+local function stopMainLoop()
+	if Conns.main then Conns.main:Disconnect(); Conns.main = nil end
+end
+
+local function refreshMainLoop()
+	if State.VoiceFilter or State.MicSpoof then
+		installMuteHook()
+		startMainLoop()
+	else
+		stopMainLoop()
+		removeMuteHook()
 	end
 end
-local function disableMS()
-	if Conns.ms then Conns.ms:Disconnect(); Conns.ms = nil end
-end
+
+local function enableVF()  refreshMainLoop() end
+local function disableVF() refreshMainLoop() end
+local function enableMS()  refreshMainLoop() end
+local function disableMS() refreshMainLoop() end
+
+-- AntiKick: scan tiap 2s bukan tiap frame — hemat CPU, tambah filter "warn"
+local akScanAcc = 0
+local AK_SCAN_INTERVAL = 2.0
 
 local function enableAK()
 	if not Conns.ak then
-		Conns.ak = RunService.Heartbeat:Connect(function()
+		Conns.ak = RunService.Heartbeat:Connect(function(dt)
 			if not State.AntiKick then return end
+			akScanAcc = akScanAcc + dt
+			if akScanAcc < AK_SCAN_INTERVAL then return end
+			akScanAcc = 0
 			for _, obj in ipairs(game:GetDescendants()) do
 				if obj:IsA("RemoteEvent") and not hooked[obj] then
 					local n = obj.Name:lower()
@@ -319,7 +346,9 @@ local function enableAK()
 									if type(a[1]) == "string" then
 										local low = a[1]:lower()
 										if low:find("kick") or low:find("ban")
-											or low:find("mute") then return end
+											or low:find("mute") or low:find("warn") then
+											return
+										end
 									end
 									return orig(...)
 								end)
@@ -346,6 +375,79 @@ buildToggle("🎤", "Mic Spoof\nForce mic ON", "MicSpoof", function(on)
 end)
 buildToggle("🛡️", "Anti-Kick Voice\nFilter kick remote", "AntiKick", function(on)
 	if on then enableAK() else disableAK() end
+end)
+
+------------------------------------------------------------------------
+-- WARNING UI SUPPRESSOR
+-- Roblox voice warning muncul sebagai TextLabel/Frame di CoreGui atau
+-- PlayerGui dengan nama/text yang mengandung kata warning/violation/moderation.
+-- Kita scan tiap 2s dan hide semua yang match.
+------------------------------------------------------------------------
+local StarterGui = game:GetService("StarterGui")
+local WARNING_KEYWORDS = {
+	"warn", "violation", "moderat", "inappropriate",
+	"voice", "suspend", "restrict", "guideline", "policy"
+}
+
+local function containsWarningText(s)
+	if type(s) ~= "string" then return false end
+	local low = s:lower()
+	for _, kw in ipairs(WARNING_KEYWORDS) do
+		if low:find(kw) then return true end
+	end
+	return false
+end
+
+local function suppressWarningUIs(root)
+	for _, obj in ipairs(root:GetDescendants()) do
+		-- hide frame/label yang namanya atau textnya ngandung warning keyword
+		if obj:IsA("TextLabel") or obj:IsA("TextButton") then
+			if containsWarningText(obj.Text) or containsWarningText(obj.Name) then
+				local p = obj.Parent
+				-- hide parent frame biar nggak ada ghost space
+				if p and p:IsA("Frame") and containsWarningText(p.Name) then
+					p.Visible = false
+				else
+					obj.Visible = false
+				end
+			end
+		elseif obj:IsA("Frame") or obj:IsA("ScreenGui") then
+			if containsWarningText(obj.Name) then
+				obj.Visible = false
+			end
+		end
+	end
+end
+
+-- scan CoreGui (warning Roblox native) + PlayerGui (warning dari game server)
+local warnScanAcc = 0
+local WARN_SCAN_INTERVAL = 1.5
+Conns.warnScan = RunService.Heartbeat:Connect(function(dt)
+	warnScanAcc = warnScanAcc + dt
+	if warnScanAcc < WARN_SCAN_INTERVAL then return end
+	warnScanAcc = 0
+	pcall(function() suppressWarningUIs(game:GetService("CoreGui")) end)
+	pcall(function() suppressWarningUIs(PlayerGui) end)
+end)
+
+-- ChildAdded hook di CoreGui supaya warning baru langsung kehide
+pcall(function()
+	game:GetService("CoreGui").DescendantAdded:Connect(function(obj)
+		task.defer(function() -- defer biar obj sempat fully init
+			if not obj or not obj.Parent then return end
+			if obj:IsA("TextLabel") or obj:IsA("TextButton") then
+				if containsWarningText(obj.Text) or containsWarningText(obj.Name) then
+					obj.Visible = false
+					local p = obj.Parent
+					if p and p:IsA("Frame") then p.Visible = false end
+				end
+			elseif obj:IsA("Frame") or obj:IsA("ScreenGui") then
+				if containsWarningText(obj.Name) then
+					obj.Visible = false
+				end
+			end
+		end)
+	end)
 end)
 
 ------------------------------------------------------------------------
@@ -405,14 +507,32 @@ UIS.InputEnded:Connect(function(inp)
 end)
 
 ------------------------------------------------------------------------
--- TUTUP PANEL KLIK LUAR
+-- TUTUP PANEL KLIK LUAR — v5: cek per-row bounds bukan container
 ------------------------------------------------------------------------
+-- Kumpulkan semua row frame dari SF supaya inPanel() bisa cek tiap row
+-- langsung. Fix root cause: row ke-3 overflow keluar Panel.AbsoluteSize.
+local rowFrames = {}
+for _, child in ipairs(SF:GetChildren()) do
+	if child:IsA("Frame") then
+		table.insert(rowFrames, child)
+	end
+end
+SF.ChildAdded:Connect(function(child)
+	if child:IsA("Frame") then
+		table.insert(rowFrames, child)
+	end
+end)
+
 UIS.InputBegan:Connect(function(inp)
 	local t = inp.UserInputType
 	if t ~= Enum.UserInputType.MouseButton1
 		and t ~= Enum.UserInputType.Touch then return end
 	if not State.PanelOpen then return end
 	if Drag.holding then return end
+	-- v6 fix: kalau GUI udah proses input ini (tombol toggle diklik),
+	-- jangan close panel. inp.Processed = true berarti ada GuiButton
+	-- yang udah consume event ini — itu pasti toggle row, bukan click luar.
+	if inp.Processed then return end
 	local mp = (t == Enum.UserInputType.Touch)
 		and Vector2.new(inp.Position.X, inp.Position.Y)
 		or  UIS:GetMouseLocation()
@@ -421,21 +541,13 @@ UIS.InputBegan:Connect(function(inp)
 		return mp.X >= ap.X and mp.X <= ap.X + as.X
 			and mp.Y >= ap.Y and mp.Y <= ap.Y + as.Y
 	end
-	-- cek Panel DAN ScrollingFrame (SF bisa extend beyond Panel.AbsoluteSize
-	-- karena AutomaticCanvasSize, row #3 bisa keitung di luar Panel bounds)
-	local function inPanel()
-		if inBox(Panel) then return true end
-		-- fallback: cek SF absolute bounds langsung
-		local ap, as = SF.AbsolutePosition, SF.AbsoluteSize
-		return mp.X >= ap.X and mp.X <= ap.X + as.X
-			and mp.Y >= ap.Y and mp.Y <= ap.Y + as.Y
+	if inBox(Panel) or inBox(LogoFrame) then return end
+	-- fallback: cek tiap row (cover kasus row overflow bounds Panel)
+	for _, row in ipairs(rowFrames) do
+		if inBox(row) then return end
 	end
-	task.defer(function()
-		if not inPanel() and not inBox(LogoFrame) then
-			State.PanelOpen = false
-			Panel.Visible   = false
-		end
-	end)
+	State.PanelOpen = false
+	Panel.Visible   = false
 end)
 
 ------------------------------------------------------------------------
