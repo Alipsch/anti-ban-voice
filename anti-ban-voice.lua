@@ -291,8 +291,15 @@ local function startMainLoop()
 	if Conns.main then return end
 	Conns.main = RunService.Heartbeat:Connect(function(dt)
 		-- Ghost Mic ON: voice chat resmi harus stay muted, jangan di-force unmute
+		-- kalau hookfunction nil (executor nggak support), spam SetMuted tiap frame sebagai fallback
 		if State.GhostMic then
 			pcall(function() VoiceChatSvc:SetMuted(true) end)
+			-- fallback tanpa hook: juga coba via LocalPlayer MicEnabled property
+			pcall(function()
+				if lp.GameSettings then
+					lp.GameSettings.MicrophoneEnabled = false
+				end
+			end)
 			return
 		end
 		if State.VoiceFilter or State.MicSpoof then
@@ -429,6 +436,13 @@ local function enableGM()
 	wire.SourceInstance = gmInput
 	wire.TargetInstance = gmEmitter
 	wire.Parent         = root
+
+	-- Pasang AudioListener di karakter lo sendiri juga
+	-- (biar lo bisa denger feedback dan emitter propagate ke diri sendiri)
+	if not root:FindFirstChildOfClass("AudioListener") then
+		local selfListener = Instance.new("AudioListener")
+		selfListener.Parent = root
+	end
 
 	-- Minta server pasang AudioListener di semua player
 	pcall(function() getOrCreateRemote():FireServer("setup") end)
